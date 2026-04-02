@@ -17,29 +17,13 @@ Then use `/mcp-oauth-debug` in Claude Code (you might need to restart Claude Cod
 ## How it works
 
 ```
-  POST /initialize (no auth)
-         |
-         v
-  401 + WWW-Authenticate: Bearer resource_metadata="..."   <-- Phase 1
-         |
-         v
-  GET resource_metadata URL (or .well-known fallback)       <-- Phase 2
-         |
-         v
-  GET /.well-known/oauth-authorization-server               <-- Phase 3
-         |
-         v
-  POST registration_endpoint (DCR)                          <-- Phase 4
-         |
-         v
-  Browser auth + code exchange + PKCE                       <-- Phase 5
-         |
-         v
-  POST /initialize + /tools/list (with token)               <-- Phase 6
-         |
-         v
-  COMPLIANCE SUMMARY
-  [+] Pass: 16  [x] Fail: 3  [!] Warn: 2  [-] Skip: 0
+  1. POST /initialize (no auth) --> 401 + WWW-Authenticate
+  2. GET resource_metadata (challenge hint or .well-known)
+  3. GET /.well-known/oauth-authorization-server
+  4. POST registration_endpoint (DCR)
+  5. Browser auth + code exchange + PKCE
+  6. POST /initialize + /tools/list (with token)
+     --> COMPLIANCE SUMMARY
 ```
 
 Each step reports pass/fail/warn with RFC references. The summary at the end shows exactly where the server deviates from spec.
@@ -48,6 +32,13 @@ Each step reports pass/fail/warn with RFC references. The summary at the end sho
 
 - [SKILL.md](SKILL.md) -- full specification, phase details, and failure pattern reference
 - [scripts/oauth-debug.ts](scripts/oauth-debug.ts) -- the compliance probe script
+- [references/](references/) -- RFC excerpts and MCP spec snippets:
+  - [RFC 9728](references/rfc-9728-protected-resource-metadata.md) -- Protected Resource Metadata
+  - [RFC 8414](references/rfc-8414-authorization-server-metadata.md) -- Authorization Server Metadata
+  - [RFC 7591](references/rfc-7591-dynamic-client-registration.md) -- Dynamic Client Registration
+  - [RFC 6750](references/rfc-6750-bearer-token.md) -- Bearer Token / WWW-Authenticate
+  - [RFC 7636](references/rfc-7636-pkce.md) -- PKCE
+  - [MCP Spec](references/mcp-spec-authorization.md) -- MCP Authorization (2025-03-26)
 
 ## Contributing
 
