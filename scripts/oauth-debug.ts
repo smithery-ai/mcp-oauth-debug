@@ -42,6 +42,27 @@ const portIdx = process.argv.indexOf("--port")
 const CALLBACK_PORT = portIdx !== -1 ? parseInt(process.argv[portIdx + 1], 10) : 9877
 const CALLBACK_URL = `http://localhost:${CALLBACK_PORT}/callback`
 
+// ── Correlation IDs ─────────────────────────────────────────────
+// Threaded through every leg so the full waterfall — script-driven
+// fetches AND browser-driven redirects — is recoverable from one query
+// against the server's tracing backend.
+//
+//   probeId       — short id baked into DCR client_name and OAuth `state`.
+//                   Survives browser redirects (state is mandatory and echoed).
+//                   Lands in any URL-logging span as a substring.
+//   clientTraceId — W3C traceparent traceId, set on every script fetch.
+//                   Spec-compliant tracing infra (e.g. @microlabs/otel-cf-workers)
+//                   continues this trace on the server, so all script→server
+//                   spans share one TraceId.
+const probeId = randomBytes(4).toString("hex")
+const clientTraceId = randomBytes(16).toString("hex")
+const clientSpanId = randomBytes(8).toString("hex")
+const traceparent = `00-${clientTraceId}-${clientSpanId}-01`
+
+console.log(`\n  probe_id:       ${probeId}`)
+console.log(`  client_traceId: ${clientTraceId}`)
+console.log(`  traceparent:    ${traceparent}`)
+
 // ── Helpers ──────────────────────────────────────────────────────
 function log(label: string, data: unknown) {
   console.log(`\n── ${label} ──`)
@@ -92,7 +113,11 @@ let challengeScopes: string | null = null
 try {
   const probe = await fetch(mcpUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      traceparent,
+    },
     body: probeBody,
   })
   probeStatus = probe.status
@@ -164,7 +189,7 @@ let prm: Record<string, unknown> | null = null
 if (challengeResourceMetadata) {
   console.log(`  Trying challenge hint: ${challengeResourceMetadata}`)
   try {
-    const res = await fetch(challengeResourceMetadata, { headers: { Accept: "application/json" } })
+    const res = await fetch(challengeResourceMetadata, { headers: { Accept: "application/json", traceparent } })
     if (res.ok) {
       prm = await res.json() as Record<string, unknown>
       record("Discovery via challenge hint", "pass", `Found metadata at ${challengeResourceMetadata}`, "RFC 9728 §3.1")
@@ -181,7 +206,7 @@ if (!prm && path) {
   const pathInserted = `${base.origin}/.well-known/oauth-protected-resource${path}`
   console.log(`  Trying path-inserted: ${pathInserted}`)
   try {
-    const res = await fetch(pathInserted, { headers: { Accept: "application/json" } })
+    const res = await fetch(pathInserted, { headers: { Accept: "application/json", traceparent } })
     if (res.ok) {
       prm = await res.json() as Record<string, unknown>
       record("Discovery via path-inserted .well-known", "pass", `Found at ${pathInserted}`, "RFC 9728 §3.3")
@@ -200,7 +225,7 @@ if (!prm) {
   const rootUrl = `${base.origin}/.well-known/oauth-protected-resource`
   console.log(`  Trying root: ${rootUrl}`)
   try {
-    const res = await fetch(rootUrl, { headers: { Accept: "application/json" } })
+    const res = await fetch(rootUrl, { headers: { Accept: "application/json", traceparent } })
     if (res.ok) {
       prm = await res.json() as Record<string, unknown>
       record("Discovery via root .well-known", "pass", `Found at ${rootUrl}`, "RFC 9728 §3.3")
@@ -285,7 +310,7 @@ let asm: Record<string, unknown> | null = null
 for (const attempt of asmAttempts) {
   console.log(`  Trying ${attempt.label}: ${attempt.url}`)
   try {
-    const res = await fetch(attempt.url, { headers: { Accept: "application/json" } })
+    const res = await fetch(attempt.url, { headers: { Accept: "application/json", traceparent } })
     if (res.ok) {
       asm = await res.json() as Record<string, unknown>
       record(`AS metadata (${attempt.label})`, "pass", `Found at ${attempt.url}`, attempt.spec)
@@ -365,9 +390,9 @@ if (registrationEndpoint) {
   try {
     const regRes = await fetch(registrationEndpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", traceparent },
       body: JSON.stringify({
-        client_name: "MCP OAuth Compliance Probe",
+        client_name: `mcp-oauth-debug:${probeId}`,
         redirect_uris: [CALLBACK_URL],
         grant_types: ["authorization_code", "refresh_token"],
         response_types: ["code"],
@@ -413,7 +438,10 @@ console.log(`\n== Phase 5: Authorization Code Flow\n`)
 
 const codeVerifier = randomBytes(32).toString("base64url")
 const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url")
-const state = randomBytes(16).toString("hex")
+// State carries the probe_id so the value lands in any URL-logging span
+// (apps/auth's /authorize, /callback, redirect 302). RFC 6749 §10.12 requires
+// the AS echo state verbatim, so it survives every redirect including browser hops.
+const state = `probe-${probeId}-${randomBytes(8).toString("hex")}`
 const scopes = scopeOverride ?? challengeScopes ?? scopesSupported.join(" ")
 
 const authUrl = new URL(authEndpoint)
@@ -437,6 +465,10 @@ const { code } = await new Promise<{ code: string }>((resolve, reject) => {
   const settle = (fn: () => void) => { if (!settled) { settled = true; fn() } }
 
   const server = createServer((req, res) => {
+    // Log every inbound — gives instant feedback that the redirect landed,
+    // even if the response flush stalls behind a keep-alive socket.
+    console.log(`  ← ${req.method} ${req.url}`)
+
     const url = new URL(req.url!, `http://localhost:${CALLBACK_PORT}`)
     if (url.pathname !== "/callback") {
       res.writeHead(404)
@@ -447,34 +479,34 @@ const { code } = await new Promise<{ code: string }>((resolve, reject) => {
     const error = url.searchParams.get("error")
     const errorDesc = url.searchParams.get("error_description")
     if (error) {
-      res.writeHead(200, { "Content-Type": "text/html" })
-      res.end(`<h2>Authorization failed</h2><p>${error}: ${errorDesc ?? ""}</p>`, () => {
-        server.close()
-        settle(() => {
-          record("Authorization", "fail", `${error}: ${errorDesc ?? "no description"}`)
-          reject(new Error(`OAuth error: ${error} - ${errorDesc}`))
-        })
+      // Resolve/reject the promise FIRST, then write the response. The
+      // browser-facing HTML is decorative; the script's progress shouldn't
+      // wait on socket flush callbacks.
+      settle(() => {
+        record("Authorization", "fail", `${error}: ${errorDesc ?? "no description"}`)
+        reject(new Error(`OAuth error: ${error} - ${errorDesc}`))
       })
+      res.writeHead(200, { "Content-Type": "text/html" })
+      res.end(`<h2>Authorization failed</h2><p>${error}: ${errorDesc ?? ""}</p>`)
+      server.close()
       return
     }
 
     if (url.searchParams.get("state") !== state) {
-      res.writeHead(200, { "Content-Type": "text/html" })
-      res.end("<h2>State mismatch</h2>", () => {
-        server.close()
-        settle(() => {
-          record("State validation", "fail", `Returned state doesn't match sent state`)
-          reject(new Error("State mismatch"))
-        })
+      settle(() => {
+        record("State validation", "fail", `Returned state doesn't match sent state`)
+        reject(new Error("State mismatch"))
       })
+      res.writeHead(200, { "Content-Type": "text/html" })
+      res.end("<h2>State mismatch</h2>")
+      server.close()
       return
     }
 
+    settle(() => resolve({ code: url.searchParams.get("code")! }))
     res.writeHead(200, { "Content-Type": "text/html" })
-    res.end("<h2>Authorization successful</h2><p>You can close this tab.</p>", () => {
-      server.close()
-      settle(() => resolve({ code: url.searchParams.get("code")! }))
-    })
+    res.end("<h2>Authorization successful</h2><p>You can close this tab.</p>")
+    server.close()
   })
 
   server.on("error", (err: NodeJS.ErrnoException) => {
@@ -487,7 +519,7 @@ const { code } = await new Promise<{ code: string }>((resolve, reject) => {
 
   server.listen(CALLBACK_PORT, () => {
     console.log(`\n  Callback on http://localhost:${CALLBACK_PORT}`)
-    console.log(`  Opening browser... (waiting for authorization, 30s timeout)\n`)
+    console.log(`  Opening browser... (waiting for authorization, 2min timeout)\n`)
     const { execSync } = require("node:child_process")
     try {
       execSync(`open "${authUrl.toString()}"`)
@@ -499,7 +531,7 @@ const { code } = await new Promise<{ code: string }>((resolve, reject) => {
   setTimeout(() => {
     server.close()
     settle(() => reject(new Error("Timed out (2 min)")))
-  }, 30_000)
+  }, 120_000)
 })
 
 record("Authorization code", "pass", `Received code: ${code.slice(0, 20)}...`)
@@ -519,7 +551,7 @@ if (clientSecret) tokenParams.set("client_secret", clientSecret)
 
 const tokenRes = await fetch(tokenEndpoint, {
   method: "POST",
-  headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+  headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json", traceparent },
   body: tokenParams.toString(),
 })
 
@@ -615,8 +647,11 @@ async function mcpCall(method: string, params: Record<string, unknown> = {}, id 
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Accept: "application/json",
+      // Streamable-HTTP MCP transport requires both content types in Accept;
+      // sending only application/json triggers 406 on spec-compliant servers.
+      Accept: "application/json, text/event-stream",
       Authorization: `Bearer ${accessToken}`,
+      traceparent,
     },
     body: JSON.stringify({ jsonrpc: "2.0", method, params, id }),
   })
@@ -673,7 +708,31 @@ if (listRes.status === 200) {
 // ══════════════════════════════════════════════════════════════════
 // SUMMARY
 // ══════════════════════════════════════════════════════════════════
+printTraceLookup()
 printSummary()
+
+function printTraceLookup() {
+  // The probe threaded `probeId` into the OAuth `state` (and DCR `client_name`)
+  // and a W3C `traceparent` into every script-driven fetch. Either one is
+  // enough to pull the full waterfall — `state` covers the browser-driven
+  // legs, `traceparent` covers the script-driven legs.
+  console.log(`\n${"═".repeat(60)}`)
+  console.log(`  CH trace lookup`)
+  console.log(`${"═".repeat(60)}`)
+  console.log(`  probe_id:        ${probeId}`)
+  console.log(`  client_traceId:  ${clientTraceId}`)
+  console.log(`\n  -- Paste into ClickHouse:`)
+  console.log(`  SELECT Timestamp, ServiceName, SpanName,`)
+  console.log(`         Duration / 1e6 AS ms, StatusCode,`)
+  console.log(`         SpanAttributes['http.url'] AS url`)
+  console.log(`  FROM otel.otel_traces`)
+  console.log(`  WHERE Timestamp > now() - INTERVAL 30 MINUTE`)
+  console.log(`    AND (`)
+  console.log(`      SpanAttributes['http.url'] LIKE '%probe-${probeId}%'`)
+  console.log(`      OR TraceId = '${clientTraceId}'`)
+  console.log(`    )`)
+  console.log(`  ORDER BY Timestamp ASC`)
+}
 
 function printSummary() {
   const passes = results.filter(r => r.status === "pass").length
